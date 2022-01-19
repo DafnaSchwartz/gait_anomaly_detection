@@ -21,13 +21,16 @@ FOR SPECIFIC TENSORFLOW CALLS, PLEASE REFER TO https://www.tensorflow.org
 """
 import numpy as np 
 import tensorflow as tf
-import data_utils as du 
+import raw_acc_data_physionet_walking_wrist as du
+import ipdb
 
 """
 Parameters deinition
 
 Change the batch_size according to the available memory, the bigger, the better
 """
+eval_only = True
+
 batch_size = 16
 num_layers = 2
 num_units = 512
@@ -48,6 +51,7 @@ pipelines, please refer to the official tf documentation
 """
 def build_training_iterator(data_filename = du.np_data_fname):
 	data = np.load(data_filename)
+	# ipdb.set_trace()
 	data = data[:int(len(data)*0.9)]
 	print(len(data))
 	dataset = tf.data.Dataset.from_tensor_slices(tf.cast(data, 
@@ -63,6 +67,13 @@ def build_test_iterator(data_filename = du.np_data_fname):
 	dataset = dataset.batch(len(data))
 	test_iterator = dataset.make_initializable_iterator()
 	return test_iterator
+def build_HD_iterator(data_filename = du.np_data_HD_fname):
+	data = np.load(data_filename)
+	dataset = tf.data.Dataset.from_tensor_slices(tf.cast(data, 
+		dtype = tf.float32))
+	dataset = dataset.batch(batch_size)
+	HD_iterator = dataset.make_initializable_iterator()
+	return HD_iterator
 
 """
 We use a bidirectional deep LSTM encoder, hence we define a forward (fw) block
@@ -181,6 +192,7 @@ if __name__ == '__main__':
 		sequence = iterator.get_next()
 		training_iterator = build_training_iterator()
 		test_iterator = build_test_iterator()
+		HD_iterator = build_HD_iterator()
 		fw_cell = build_fw_cell(keep_prob = keep_prob)
 		bw_cell = build_bw_cell(keep_prob = keep_prob)
 		output, state =  build_rnn_autoencoder(
@@ -190,11 +202,12 @@ if __name__ == '__main__':
 			sequence_lengths = du.STEPS)
 		output = tf.concat(output, 2)
 		predictions = build_output_layer(source = output, 
-			output_dim = 9)
+			output_dim = du.FEATURES)
 		loss = training_loss(targets = sequence, 
 			predictions = predictions)
-		update_step, learning_rate = training_step(loss = loss, 
-			global_step = global_step)
+		if not eval_only:
+			update_step, learning_rate = training_step(loss = loss, 
+				global_step = global_step)
 		tf.summary.scalar('loss', loss)
 		init = tf.global_variables_initializer()
 		merged_summary = tf.summary.merge_all()
@@ -203,7 +216,9 @@ if __name__ == '__main__':
 	train_sess.run(init)
 	training_handle = train_sess.run(training_iterator.string_handle())
 	test_handle = train_sess.run(test_iterator.string_handle())
+	HD_handle = train_sess.run(HD_iterator.string_handle())
 	train_sess.run(training_iterator.initializer)
+	train_sess.run(HD_iterator.initializer)
 	writer_1 = tf.summary.FileWriter('./checkpoint/train/', train_graph)
 	writer_2 = tf.summary.FileWriter('./checkpoint/eval/', train_graph)
 	epoch = 0
@@ -211,32 +226,53 @@ if __name__ == '__main__':
 	"""
 	Main train/eval loop
 	"""
-	for step in range(STEPS):
-		try:
-			summary, l, u_s, l_r, o, p = train_sess.run(
-				[merged_summary, loss, update_step, learning_rate, output, predictions],
-				feed_dict = {handle: training_handle})
-		except tf.errors.OutOfRangeError:
-			train_sess.run(training_iterator.initializer)
-			summary, l, u_s, l_r, o, p = train_sess.run(
-				[merged_summary, loss, update_step, learning_rate, output, predictions],
-				feed_dict = {handle: training_handle})
-			epoch+=1
-		if step%50 == 0:
-			writer_1.add_summary(summary, step)
-			print('Epoch -> %d\tStep -> %d,\tloss -> %f' % (epoch, step, l))
-			train_sess.run(test_iterator.initializer)
-			summary, val_loss = train_sess.run([merged_summary, loss], 
-				feed_dict = {keep_prob: 1.0, handle: test_handle})
-			writer_2.add_summary(summary, step)
-			print('EVAL LOSS -> %f' % val_loss)
-		if step%500 == 0:
-			train_saver.save(train_sess, 
-					'./checkpoint/model',
-	    			global_step = step+1)
-	train_saver.save(train_sess, 
-		'./checkpoint/model')
-	writer_1.close()
-	writer_2.close()
+	if eval_only:
+		train_saver.restore(train_sess,tf.train.latest_checkpoint('/home/dafnas1/gait_anomaly_detection/Seq2Seq-gait-analysis/checkpoint'))
+		# ipdb.set_trace()
+		euc_distance = []
+		for step in range(100):
+			try:
+				[seq,pred] = train_sess.run([sequence, predictions],feed_dict = {handle: HD_handle})
+				euc_distance.append(np.linalg.norm(pred-seq, axis = (1,2)))
+			except tf.errors.OutOfRangeError:
+				break
+			if step%20 == 0:
+				print(f"storing npy of step {step}")
+				np.save('HD_without_preproc_input_seq_step_{}.npy'.format(step),seq)
+				np.save('HD_without_preproc_prediction_at_output_step_{}.npy'.format(step),pred)
+		
+		euc_distance_arr = np.concatenate(euc_distance)
+		np.save('HD_without_preproc_euc_distance_arr.npy',euc_distance_arr)
+
+	else:
+		for step in range(STEPS):
+			try:
+				summary, l, u_s, l_r, seq, o, p = train_sess.run(
+					[merged_summary, loss, update_step, learning_rate, sequence, output, predictions],
+					feed_dict = {handle: training_handle})
+			except tf.errors.OutOfRangeError:
+				train_sess.run(training_iterator.initializer)
+				summary, l, u_s, l_r, o, p = train_sess.run(
+					[merged_summary, loss, update_step, learning_rate, output, predictions],
+					feed_dict = {handle: training_handle})
+				epoch+=1
+			if step%50 == 0:
+				writer_1.add_summary(summary, step)
+				print('Epoch -> %d\tStep -> %d,\tloss -> %f' % (epoch, step, l))
+				train_sess.run(test_iterator.initializer)
+				summary, val_loss = train_sess.run([merged_summary, loss], 
+					feed_dict = {keep_prob: 1.0, handle: test_handle})
+				writer_2.add_summary(summary, step)
+				print('EVAL LOSS -> %f' % val_loss)
+			if step%500 == 0:
+				train_saver.save(train_sess, 
+						'./checkpoint/model',
+						global_step = step+1)
+				np.save('input_seq_step_{}.npy'.format(step),seq)
+				np.save('prediction_at_output_step_{}.npy'.format(step),p)
+		train_saver.save(train_sess, 
+			'./checkpoint/model')
+		writer_1.close()
+		writer_2.close()
 
 
